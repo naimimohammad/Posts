@@ -1,0 +1,227 @@
+service: aws-nodejs
+
+
+functions:
+  receiver:
+    timeout: 20
+    handler: src/processor.processor
+    role: arn:aws:iam::${aws:accountId}:role/LambdaExecutionRole 
+    vpc:
+      securityGroupIds:
+        - !Ref MyCacheSecurityGroup 
+        - !Ref LambdaSecurityGroup
+      subnetIds:
+        - Ref: MySubnet
+        - Ref: MySubnet2
+        # - Ref: PublicSubnet
+    environment:
+      POST_TABLE_NAME: !Ref PostsTable
+      REDIS_URL: !GetAtt CacheCluster.RedisEndpoint.Address
+      REDIS_PORT: !GetAtt CacheCluster.RedisEndpoint.Port
+    events:
+      - http:
+          path: posts/{page}
+          method: get
+
+provider:
+  name: aws
+  profile: default
+  region: eu-west-1
+  runtime: nodejs20.x
+  stage: ${opt:stage, 'dev'}
+  iamRoleStatements:
+    - Effect: Allow
+      Action:
+        - ec2:CreateNetworkInterface
+        - ec2:DescribeNetworkInterfaces
+        - ec2:DeleteNetworkInterface
+        - lambda:InvokeFunction
+        - dynamodb:Query
+        - elasticache:Connect
+        - "iot:*"
+      Resource: "*"  
+
+resources:
+  Resources:
+    PostsTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: Retain
+      UpdateReplacePolicy: Retain
+      Properties:
+        TableName: Posts-${self:provider.stage}
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+          - AttributeName: timestamp
+            AttributeType: S
+          - AttributeName: type
+            AttributeType: S
+        BillingMode: PAY_PER_REQUEST
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH  
+
+        GlobalSecondaryIndexes:
+          - IndexName: TypeIndex
+            KeySchema:
+              - AttributeName: type
+                KeyType: HASH
+              - AttributeName: timestamp
+                KeyType: RANGE    
+            Projection:
+              ProjectionType: ALL
+    MyVpc:
+      Type: AWS::EC2::VPC
+      Properties:
+        CidrBlock: 10.0.0.0/16
+        EnableDnsSupport: true
+        EnableDnsHostnames: true
+        Tags:
+          - Key: Name
+            Value: my-vpc
+    MySubnet:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: !Ref MyVpc
+        CidrBlock: 10.0.0.0/24
+        AvailabilityZone: eu-west-1a
+    MySubnet2:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: !Ref MyVpc
+        CidrBlock: 10.0.1.0/24
+        AvailabilityZone: eu-west-1b
+    MyCacheSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        VpcId: !Ref MyVpc
+        GroupDescription: Allow inbound traffic from Lambda to Elasticache
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 6379
+            ToPort: 6379
+            SourceSecurityGroupId: !Ref LambdaSecurityGroup
+    MyCacheSubnetGroup:
+      Type: AWS::ElastiCache::SubnetGroup
+      Properties:
+        Description: Subnet group for my cache cluster
+        SubnetIds:
+          - Ref: MySubnet
+          - Ref: MySubnet2
+    LambdaSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: "Allow Lambda to access Redis"
+        VpcId: !Ref MyVpc 
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 6379  
+            ToPort: 6379
+            CidrIp: "0.0.0.0/0"
+        SecurityGroupEgress:
+          - IpProtocol: tcp
+            FromPort: 443  
+            ToPort: 443
+            CidrIp: 0.0.0.0/0
+
+    CacheCluster:
+      Type: AWS::ElastiCache::CacheCluster
+      Properties:
+        CacheNodeType: cache.t3.micro
+        Engine: redis
+        NumCacheNodes: 1
+        CacheSubnetGroupName: !Ref MyCacheSubnetGroup
+        VpcSecurityGroupIds:
+          - !Ref MyCacheSecurityGroup
+        
+
+    LambdaExecutionRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: LambdaExecutionRole 
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: lambda.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+        - PolicyName: "LambdaLogPolicy"
+          PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - dynamodb:Query
+                    - dynamodb:Scan
+                    - "logs:CreateLogGroup"
+                    - "logs:CreateLogStream"
+                    - "logs:PutLogEvents"
+                    - "elasticache:Connect"
+                    - "ec2:CreateNetworkInterface"
+                    - "ec2:DescribeNetworkInterfaces"
+                    - "ec2:DeleteNetworkInterface"
+                    - "iot:*"
+                  Resource: "*"
+    
+
+    MyInternetGateway:
+      Type: AWS::EC2::InternetGateway
+
+
+    AttachIGW:
+      Type: AWS::EC2::VPCGatewayAttachment
+      Properties:
+        VpcId: !Ref MyVpc
+        InternetGatewayId: !Ref MyInternetGateway
+
+    PrivateRouteTable:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId: !Ref MyVpc
+
+
+    PrivateRouteTableAssociation1:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId: !Ref MySubnet
+        RouteTableId: !Ref PrivateRouteTable
+
+    PrivateRouteTableAssociation2:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId: !Ref MySubnet2
+        RouteTableId: !Ref PrivateRouteTable
+
+   ########################
+    PublicSubnet:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: !Ref MyVpc
+        CidrBlock: 10.0.3.0/24
+        AvailabilityZone: eu-west-1a 
+        MapPublicIpOnLaunch: true     
+    NatGateway:
+      Type: AWS::EC2::NatGateway
+      Properties:
+        AllocationId: !GetAtt NatGatewayEIP.AllocationId
+        SubnetId: !Ref PublicSubnet    
+    NatGatewayEIP:
+      Type: AWS::EC2::EIP
+    PrivateRoute:
+      Type: AWS::EC2::Route
+      Properties:
+        DestinationCidrBlock: 0.0.0.0/0
+        GatewayId: !Ref NatGateway
+        RouteTableId: !Ref PrivateRouteTable  
+
+
+    DynamoDBVpcEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        ServiceName: !Sub "com.amazonaws.${AWS::Region}.dynamodb"
+        VpcId: !Ref MyVpc
+        VpcEndpointType: Gateway
+        RouteTableIds:
+          - !Ref PrivateRouteTable
